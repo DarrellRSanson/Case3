@@ -1,0 +1,523 @@
+"""
+IBM HR Attrition Segmentation Explorer
+========================================
+An interactive Gradio application built for Dr. Sarah Chen (CHRO, IBM) and the
+HR Analytics division. The tool uses K-Means clustering (unsupervised learning)
+to discover natural employee segments in IBM's 2025 workforce sample, profiles
+each segment's demographic, job, seniority, and satisfaction characteristics,
+reports each segment's observed attrition rate, and lets an HR analyst
+simulate a hypothetical employee to see which segment they resemble most.
+
+IMPORTANT: The model does NOT predict individual attrition. It is a
+descriptive/exploratory clustering tool. The "simulator" assigns a
+hypothetical employee to the nearest learned cluster and reports that
+cluster's historical attrition rate as context, not a personalized
+prediction.
+
+Run locally:
+    pip install -r requirements.txt
+    python app.py
+
+Deploy: Hugging Face Spaces (Gradio SDK). Place this file, requirements.txt,
+and IBM_Dataset.csv in the same Space repository.
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+
+import gradio as gr
+
+# ----------------------------------------------------------------------------
+# 1. DATA LOADING & PREPROCESSING
+# ----------------------------------------------------------------------------
+DATA_PATH = "IBM_Dataset.csv"
+
+RAW_DF = pd.read_csv(DATA_PATH)
+
+# --- Feature selection & preprocessing rationale ---------------------------
+# All 12 predictor variables in the dictionary are used for clustering
+# (Attrition itself is EXCLUDED from the feature set: it is an outcome label
+# used only afterwards to profile/characterize clusters, never as a clustering
+# input - otherwise the clusters would trivially split on attrition itself).
+#
+# Continuous / ordinal-numeric variables (Age, Education, JobLevel,
+# JobSatisfaction, MonthlyIncome, TotalWorkingYears, WorkLifeBalance,
+# YearsAtCompany, YearsInCurrentRole, YearsWithCurrManager) are already
+# encoded as meaningful ordered integers, so they are kept as numeric and
+# z-score standardized (StandardScaler) so that variables with naturally
+# large ranges (e.g., MonthlyIncome: $1,009-$19,999) do not dominate the
+# Euclidean distances used by K-Means over small-range variables
+# (e.g., JobSatisfaction: 1-4).
+#
+# Nominal categorical variables (Department, Gender) have no inherent order,
+# so they are one-hot encoded (drop='first' to avoid redundant/collinear
+# dummy columns) rather than label-encoded, which would falsely imply an
+# ordinal relationship between categories.
+
+NUMERIC_COLS = [
+    "Age", "Education", "JobLevel", "JobSatisfaction", "MonthlyIncome",
+    "TotalWorkingYears", "WorkLifeBalance", "YearsAtCompany",
+    "YearsInCurrentRole", "YearsWithCurrManager",
+]
+CATEGORICAL_COLS = ["Department", "Gender"]
+FEATURE_COLS = NUMERIC_COLS + CATEGORICAL_COLS
+
+DEPARTMENTS = sorted(RAW_DF["Department"].unique().tolist())
+GENDERS = sorted(RAW_DF["Gender"].unique().tolist())
+
+EDUCATION_LABELS = {1: "Below College", 2: "College", 3: "Bachelor", 4: "Master", 5: "Doctor"}
+JOBLEVEL_LABELS = {1: "Entry", 2: "Junior", 3: "Mid", 4: "Senior", 5: "Executive"}
+SATISFACTION_LABELS = {1: "Low", 2: "Medium", 3: "High", 4: "Very High"}
+WLB_LABELS = {1: "Bad", 2: "Good", 3: "Better", 4: "Best"}
+
+
+def build_preprocessor():
+    return ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(), NUMERIC_COLS),
+            ("cat", OneHotEncoder(drop="first", handle_unknown="ignore"), CATEGORICAL_COLS),
+        ]
+    )
+
+
+PREPROCESSOR = build_preprocessor()
+X_ALL = PREPROCESSOR.fit_transform(RAW_DF[FEATURE_COLS])
+if hasattr(X_ALL, "toarray"):
+    X_ALL = X_ALL.toarray()
+
+# ----------------------------------------------------------------------------
+# 2. ELBOW METHOD + SILHOUETTE SCORE (k = 2..10)
+# ----------------------------------------------------------------------------
+K_RANGE = list(range(2, 11))
+
+
+def compute_k_diagnostics():
+    inertias, silhouettes = [], []
+    for k in K_RANGE:
+        km = KMeans(n_clusters=k, random_state=42, n_init=10)
+        labels = km.fit_predict(X_ALL)
+        inertias.append(km.inertia_)
+        silhouettes.append(silhouette_score(X_ALL, labels))
+    return inertias, silhouettes
+
+
+INERTIAS, SILHOUETTES = compute_k_diagnostics()
+
+# ----------------------------------------------------------------------------
+# 3. FINAL MODEL
+# ----------------------------------------------------------------------------
+# Chosen k = 4. Rationale (also detailed in the accompanying PDF report):
+#   - The elbow curve shows a clear bend around k=4: inertia reduction per
+#     additional cluster drops sharply after this point (diminishing returns).
+#   - Silhouette score is mathematically maximal at k=2, but that solution
+#     merely separates "long-tenured/senior" vs. "early-career" employees -
+#     too coarse to be actionable for HR. k=4 is the most business-
+#     interpretable solution among the higher-silhouette candidates (k=3-5),
+#     producing four clearly distinguishable, HR-actionable segments while
+#     keeping a reasonable separation quality.
+CHOSEN_K = 4
+
+FINAL_MODEL = KMeans(n_clusters=CHOSEN_K, random_state=42, n_init=10)
+CLUSTER_LABELS = FINAL_MODEL.fit_predict(X_ALL)
+
+PROFILE_DF = RAW_DF.copy()
+PROFILE_DF["Cluster"] = CLUSTER_LABELS
+PROFILE_DF["AttritionFlag"] = (PROFILE_DF["Attrition"] == "Yes").astype(int)
+
+OVERALL_ATTRITION_RATE = PROFILE_DF["AttritionFlag"].mean()
+
+# Human-readable business labels for each numeric cluster id.
+# NOTE: cluster -> label mapping is derived programmatically below from the
+# fitted centroids so it stays correct even if random_state/data changes,
+# but we keep readable fallback names.
+CLUSTER_NAME_POOL = [
+    "Early-Career High-Risk",
+    "Established Mid-Career Core",
+    "Experienced Senior Newcomers",
+    "Loyalty Anchors (Long-Tenured Seniors)",
+]
+
+
+def _assign_cluster_names():
+    """Rank clusters by average YearsAtCompany & JobLevel to assign
+    business-meaningful, descriptive names automatically."""
+    summary = PROFILE_DF.groupby("Cluster").agg(
+        YearsAtCompany=("YearsAtCompany", "mean"),
+        JobLevel=("JobLevel", "mean"),
+        TotalWorkingYears=("TotalWorkingYears", "mean"),
+        AttritionRate=("AttritionFlag", "mean"),
+    )
+    names = {}
+    # Highest attrition + lowest tenure/joblevel -> Early-Career High-Risk
+    early_risk = summary.sort_values(["AttritionRate", "YearsAtCompany"], ascending=[False, True]).index[0]
+    remaining = [c for c in summary.index if c != early_risk]
+
+    # Longest tenured -> Loyalty Anchors
+    loyalty = summary.loc[remaining].sort_values("YearsAtCompany", ascending=False).index[0]
+    remaining = [c for c in remaining if c != loyalty]
+
+    # Highest TotalWorkingYears but not longest at company -> Experienced Senior Newcomers
+    exp_new = summary.loc[remaining].sort_values("TotalWorkingYears", ascending=False).index[0]
+    remaining = [c for c in remaining if c != exp_new]
+
+    mid_core = remaining[0] if remaining else None
+
+    names[early_risk] = "Early-Career High-Risk"
+    names[loyalty] = "Loyalty Anchors (Long-Tenured Seniors)"
+    names[exp_new] = "Experienced Senior Newcomers"
+    if mid_core is not None:
+        names[mid_core] = "Established Mid-Career Core"
+    return names
+
+
+CLUSTER_NAMES = _assign_cluster_names()
+PROFILE_DF["ClusterName"] = PROFILE_DF["Cluster"].map(CLUSTER_NAMES)
+
+
+def get_cluster_summary_table():
+    agg = PROFILE_DF.groupby("Cluster").agg(
+        Segment=("ClusterName", "first"),
+        Employees=("Cluster", "size"),
+        AttritionRate=("AttritionFlag", "mean"),
+        AvgAge=("Age", "mean"),
+        AvgEducation=("Education", "mean"),
+        AvgJobLevel=("JobLevel", "mean"),
+        AvgJobSatisfaction=("JobSatisfaction", "mean"),
+        AvgMonthlyIncome=("MonthlyIncome", "mean"),
+        AvgTotalWorkingYears=("TotalWorkingYears", "mean"),
+        AvgWorkLifeBalance=("WorkLifeBalance", "mean"),
+        AvgYearsAtCompany=("YearsAtCompany", "mean"),
+        AvgYearsInCurrentRole=("YearsInCurrentRole", "mean"),
+        AvgYearsWithCurrManager=("YearsWithCurrManager", "mean"),
+    ).reset_index()
+    agg["AttritionRate"] = (agg["AttritionRate"] * 100).round(1)
+    numeric_round_cols = [c for c in agg.columns if c.startswith("Avg")]
+    agg[numeric_round_cols] = agg[numeric_round_cols].round(2)
+    agg = agg.sort_values("Cluster")
+    return agg
+
+
+CLUSTER_SUMMARY = get_cluster_summary_table()
+
+# ----------------------------------------------------------------------------
+# 4. PLOTTING HELPERS (matplotlib figures returned to Gradio)
+# ----------------------------------------------------------------------------
+
+def plot_elbow():
+    fig, ax = plt.subplots(figsize=(6, 4.2))
+    ax.plot(K_RANGE, INERTIAS, marker="o", color="#0f62fe")
+    ax.axvline(CHOSEN_K, color="#da1e28", linestyle="--", alpha=0.7, label=f"Chosen k = {CHOSEN_K}")
+    ax.set_xlabel("Number of clusters (k)")
+    ax.set_ylabel("Inertia (within-cluster sum of squares)")
+    ax.set_title("Elbow Method: Inertia vs. k")
+    ax.set_xticks(K_RANGE)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def plot_silhouette():
+    fig, ax = plt.subplots(figsize=(6, 4.2))
+    ax.plot(K_RANGE, SILHOUETTES, marker="o", color="#198038")
+    ax.axvline(CHOSEN_K, color="#da1e28", linestyle="--", alpha=0.7, label=f"Chosen k = {CHOSEN_K}")
+    ax.set_xlabel("Number of clusters (k)")
+    ax.set_ylabel("Average Silhouette Score")
+    ax.set_title("Silhouette Score vs. k")
+    ax.set_xticks(K_RANGE)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def plot_attrition_by_cluster():
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    order = CLUSTER_SUMMARY.sort_values("Cluster")
+    colors = ["#da1e28" if r > OVERALL_ATTRITION_RATE * 100 else "#198038" for r in order["AttritionRate"]]
+    ax.bar(order["Segment"], order["AttritionRate"], color=colors)
+    ax.axhline(OVERALL_ATTRITION_RATE * 100, color="black", linestyle="--", linewidth=1,
+               label=f"Company-wide avg = {OVERALL_ATTRITION_RATE*100:.1f}%")
+    ax.set_ylabel("Attrition Rate (%)")
+    ax.set_title("Observed Attrition Rate by Employee Segment")
+    ax.set_xticks(range(len(order)))
+    ax.set_xticklabels(order["Segment"], rotation=20, ha="right", fontsize=8)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def plot_cluster_sizes():
+    fig, ax = plt.subplots(figsize=(5.5, 4.2))
+    order = CLUSTER_SUMMARY.sort_values("Cluster")
+    ax.pie(order["Employees"], labels=order["Segment"], autopct="%1.0f%%",
+           textprops={"fontsize": 8}, colors=plt.cm.Set2.colors)
+    ax.set_title("Employee Segment Sizes")
+    fig.tight_layout()
+    return fig
+
+
+def plot_profile_radar(metric_cols, metric_labels):
+    """Compare cluster averages on a set of standardized metrics (bar-group chart,
+    used instead of a radar chart for maximal clarity in a static image)."""
+    order = CLUSTER_SUMMARY.sort_values("Cluster")
+    scaler_vals = {}
+    for col in metric_cols:
+        vals = order[col].values.astype(float)
+        rng = vals.max() - vals.min()
+        scaler_vals[col] = (vals - vals.min()) / rng if rng > 0 else np.zeros_like(vals)
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    n_clusters = len(order)
+    n_metrics = len(metric_cols)
+    bar_width = 0.8 / n_clusters
+    x = np.arange(n_metrics)
+    colors = plt.cm.Set2.colors
+
+    for i, (_, row) in enumerate(order.iterrows()):
+        heights = [scaler_vals[c][i] for c in metric_cols]
+        ax.bar(x + i * bar_width, heights, width=bar_width, label=row["Segment"], color=colors[i % len(colors)])
+
+    ax.set_xticks(x + bar_width * (n_clusters - 1) / 2)
+    ax.set_xticklabels(metric_labels, rotation=20, ha="right", fontsize=8)
+    ax.set_ylabel("Normalized value (0-1 within metric)")
+    ax.set_title("Segment Profile Comparison (Normalized)")
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    return fig
+
+
+RADAR_METRICS = [
+    ("AvgAge", "Age"),
+    ("AvgJobLevel", "Job Level"),
+    ("AvgMonthlyIncome", "Monthly Income"),
+    ("AvgTotalWorkingYears", "Total Working Years"),
+    ("AvgYearsAtCompany", "Years at Company"),
+    ("AvgJobSatisfaction", "Job Satisfaction"),
+    ("AvgWorkLifeBalance", "Work-Life Balance"),
+]
+
+
+def build_static_outputs():
+    elbow_fig = plot_elbow()
+    sil_fig = plot_silhouette()
+    attr_fig = plot_attrition_by_cluster()
+    size_fig = plot_cluster_sizes()
+    metric_cols = [c for c, _ in RADAR_METRICS]
+    metric_labels = [l for _, l in RADAR_METRICS]
+    profile_fig = plot_profile_radar(metric_cols, metric_labels)
+
+    display_summary = CLUSTER_SUMMARY.rename(columns={
+        "Cluster": "Cluster #",
+        "Segment": "Segment Name",
+        "Employees": "N Employees",
+        "AttritionRate": "Attrition Rate (%)",
+        "AvgAge": "Avg Age",
+        "AvgEducation": "Avg Education (1-5)",
+        "AvgJobLevel": "Avg Job Level (1-5)",
+        "AvgJobSatisfaction": "Avg Job Satisfaction (1-4)",
+        "AvgMonthlyIncome": "Avg Monthly Income ($)",
+        "AvgTotalWorkingYears": "Avg Total Working Years",
+        "AvgWorkLifeBalance": "Avg Work-Life Balance (1-4)",
+        "AvgYearsAtCompany": "Avg Years at Company",
+        "AvgYearsInCurrentRole": "Avg Years in Current Role",
+        "AvgYearsWithCurrManager": "Avg Years w/ Current Manager",
+    })
+
+    diag_df = pd.DataFrame({
+        "k": K_RANGE,
+        "Inertia": [round(v, 1) for v in INERTIAS],
+        "Silhouette Score": [round(v, 4) for v in SILHOUETTES],
+    })
+
+    kpi_md = f"""
+### Company-Wide KPIs
+- **Total employees analyzed:** {len(RAW_DF):,}
+- **Overall attrition rate:** {OVERALL_ATTRITION_RATE*100:.1f}%
+- **Number of segments (k):** {CHOSEN_K}
+- **Silhouette score at chosen k:** {SILHOUETTES[K_RANGE.index(CHOSEN_K)]:.3f}
+- **Highest-risk segment:** {CLUSTER_SUMMARY.loc[CLUSTER_SUMMARY['AttritionRate'].idxmax(), 'Segment']} \
+({CLUSTER_SUMMARY['AttritionRate'].max():.1f}% attrition)
+- **Lowest-risk segment:** {CLUSTER_SUMMARY.loc[CLUSTER_SUMMARY['AttritionRate'].idxmin(), 'Segment']} \
+({CLUSTER_SUMMARY['AttritionRate'].min():.1f}% attrition)
+"""
+    return elbow_fig, sil_fig, attr_fig, size_fig, profile_fig, display_summary, diag_df, kpi_md
+
+
+# ----------------------------------------------------------------------------
+# 5. CLUSTER ASSIGNMENT SIMULATOR
+# ----------------------------------------------------------------------------
+
+def simulate_employee(age, department, education_label, gender, joblevel_label,
+                       jobsatisfaction_label, monthlyincome, totalworkingyears,
+                       worklifebalance_label, yearsatcompany, yearsincurrentrole,
+                       yearswithcurrmanager):
+    education = {v: k for k, v in EDUCATION_LABELS.items()}[education_label]
+    joblevel = {v: k for k, v in JOBLEVEL_LABELS.items()}[joblevel_label]
+    jobsatisfaction = {v: k for k, v in SATISFACTION_LABELS.items()}[jobsatisfaction_label]
+    worklifebalance = {v: k for k, v in WLB_LABELS.items()}[worklifebalance_label]
+
+    record = pd.DataFrame([{
+        "Age": age,
+        "Education": education,
+        "JobLevel": joblevel,
+        "JobSatisfaction": jobsatisfaction,
+        "MonthlyIncome": monthlyincome,
+        "TotalWorkingYears": totalworkingyears,
+        "WorkLifeBalance": worklifebalance,
+        "YearsAtCompany": yearsatcompany,
+        "YearsInCurrentRole": yearsincurrentrole,
+        "YearsWithCurrManager": yearswithcurrmanager,
+        "Department": department,
+        "Gender": gender,
+    }])[FEATURE_COLS]
+
+    x_new = PREPROCESSOR.transform(record)
+    if hasattr(x_new, "toarray"):
+        x_new = x_new.toarray()
+
+    cluster_id = int(FINAL_MODEL.predict(x_new)[0])
+    cluster_name = CLUSTER_NAMES[cluster_id]
+    row = CLUSTER_SUMMARY[CLUSTER_SUMMARY["Cluster"] == cluster_id].iloc[0]
+
+    result_md = f"""
+## Assigned Segment: **{cluster_name}** (Cluster {cluster_id})
+
+**Historical attrition rate in this segment: {row['AttritionRate']:.1f}%**
+(company-wide average: {OVERALL_ATTRITION_RATE*100:.1f}%)
+
+| Segment Characteristic | Average Value |
+|---|---|
+| Employees in segment | {int(row['Employees'])} |
+| Average Age | {row['AvgAge']} |
+| Average Job Level (1-5) | {row['AvgJobLevel']} |
+| Average Job Satisfaction (1-4) | {row['AvgJobSatisfaction']} |
+| Average Monthly Income | ${row['AvgMonthlyIncome']:,.0f} |
+| Average Total Working Years | {row['AvgTotalWorkingYears']} |
+| Average Work-Life Balance (1-4) | {row['AvgWorkLifeBalance']} |
+| Average Years at Company | {row['AvgYearsAtCompany']} |
+| Average Years in Current Role | {row['AvgYearsInCurrentRole']} |
+| Average Years with Current Manager | {row['AvgYearsWithCurrManager']} |
+
+*Reminder: this tool assigns the hypothetical employee to the nearest learned
+cluster based on overall similarity across all workforce attributes. It does
+not predict this individual's personal probability of leaving - it identifies
+which historically observed employee segment they most resemble, so HR can
+apply that segment's known retention risk profile and intervention playbook.*
+"""
+    return result_md
+
+
+# ----------------------------------------------------------------------------
+# 6. GRADIO INTERFACE
+# ----------------------------------------------------------------------------
+
+(ELBOW_FIG, SIL_FIG, ATTR_FIG, SIZE_FIG, PROFILE_FIG,
+ DISPLAY_SUMMARY, DIAG_DF, KPI_MD) = build_static_outputs()
+
+INTRO_MD = f"""
+# IBM HR Attrition Segmentation Explorer
+### Prepared for Dr. Sarah Chen, CHRO, and the IBM HR Analytics Division
+
+This tool uses **K-Means clustering** (unsupervised learning) on a 2025
+cross-sectional sample of **{len(RAW_DF):,} IBM employee records** to uncover
+natural workforce segments and characterize each segment's demographic
+profile, job characteristics, seniority, satisfaction levels, and **observed
+attrition rate**. Use the tabs below to explore cluster quality diagnostics,
+segment profiles, and to simulate where a hypothetical employee would fall.
+
+**Note:** This is a descriptive/exploratory tool, not an individual attrition
+predictor. Simulated cases are assigned to the closest existing segment to
+help infer risk context, not to forecast a specific outcome.
+"""
+
+with gr.Blocks(title="IBM HR Attrition Segmentation Explorer", theme=gr.themes.Soft()) as demo:
+    gr.Markdown(INTRO_MD)
+    gr.Markdown(KPI_MD)
+
+    with gr.Tabs():
+        with gr.Tab("1. Cluster Quality (Elbow & Silhouette)"):
+            gr.Markdown(
+                "Evaluate clustering solutions for **k = 2 to 10** to determine "
+                "and justify the optimal number of clusters. We selected "
+                f"**k = {CHOSEN_K}** based on the elbow bend in inertia and a "
+                "strong, business-interpretable silhouette score (see PDF report "
+                "for full justification)."
+            )
+            with gr.Row():
+                gr.Plot(value=ELBOW_FIG, label="Elbow Method")
+                gr.Plot(value=SIL_FIG, label="Silhouette Score")
+            gr.Markdown("#### Diagnostics table (k = 2 to 10)")
+            gr.Dataframe(value=DIAG_DF, interactive=False)
+
+        with gr.Tab("2. Segment Profiles & Attrition"):
+            gr.Markdown("### Cluster Profile Summary Table")
+            gr.Dataframe(value=DISPLAY_SUMMARY, interactive=False, wrap=True)
+            with gr.Row():
+                gr.Plot(value=ATTR_FIG, label="Attrition Rate by Segment")
+                gr.Plot(value=SIZE_FIG, label="Segment Sizes")
+            gr.Plot(value=PROFILE_FIG, label="Segment Profile Comparison")
+
+        with gr.Tab("3. Employee Scenario Simulator"):
+            gr.Markdown(
+                "Enter a hypothetical employee's characteristics to see which "
+                "workforce segment they most closely resemble, and that "
+                "segment's historical attrition rate."
+            )
+            with gr.Row():
+                with gr.Column():
+                    age_in = gr.Slider(18, 60, value=28, step=1, label="Age")
+                    dept_in = gr.Dropdown(DEPARTMENTS, value=DEPARTMENTS[0], label="Department")
+                    edu_in = gr.Dropdown(list(EDUCATION_LABELS.values()), value="Bachelor", label="Education")
+                    gender_in = gr.Dropdown(GENDERS, value=GENDERS[0], label="Gender")
+                    joblevel_in = gr.Dropdown(list(JOBLEVEL_LABELS.values()), value="Junior", label="Job Level")
+                with gr.Column():
+                    satisfaction_in = gr.Dropdown(list(SATISFACTION_LABELS.values()), value="Low", label="Job Satisfaction")
+                    income_in = gr.Slider(1009, 19999, value=3200, step=50, label="Monthly Income ($)")
+                    totalyears_in = gr.Slider(0, 40, value=4, step=1, label="Total Working Years")
+                    wlb_in = gr.Dropdown(list(WLB_LABELS.values()), value="Good", label="Work-Life Balance")
+                with gr.Column():
+                    yearsatco_in = gr.Slider(0, 40, value=1, step=1, label="Years at Company")
+                    yearsrole_in = gr.Slider(0, 18, value=1, step=1, label="Years in Current Role")
+                    yearsmgr_in = gr.Slider(0, 17, value=1, step=1, label="Years with Current Manager")
+            simulate_btn = gr.Button("Assign to Segment", variant="primary")
+            sim_output = gr.Markdown()
+
+            simulate_btn.click(
+                fn=simulate_employee,
+                inputs=[age_in, dept_in, edu_in, gender_in, joblevel_in, satisfaction_in,
+                        income_in, totalyears_in, wlb_in, yearsatco_in, yearsrole_in, yearsmgr_in],
+                outputs=sim_output,
+            )
+
+        with gr.Tab("4. About / Methodology"):
+            gr.Markdown(f"""
+### Preprocessing
+- **Numeric / ordinal variables** ({', '.join(NUMERIC_COLS)}) were
+  **z-score standardized** (`StandardScaler`) so no single variable's scale
+  dominates the K-Means Euclidean distance calculation.
+- **Nominal categorical variables** ({', '.join(CATEGORICAL_COLS)}) were
+  **one-hot encoded** (`drop='first'`) since they carry no natural order.
+- `Attrition` is **excluded from clustering features** - it is used only
+  afterward to profile and label the resulting clusters.
+
+### Model
+- Algorithm: **K-Means** (`scikit-learn`), `n_init=10`, `random_state=42`.
+- Chosen number of clusters: **k = {CHOSEN_K}**.
+- Diagnostics evaluated for k = 2 through 10 using the **Elbow Method**
+  (inertia / within-cluster sum of squares) and the **Silhouette Score**.
+
+### Disclaimer
+This application is a descriptive analytics and scenario-exploration tool.
+It identifies workforce segments and their historical attrition patterns; it
+does **not** predict whether any specific individual will leave IBM.
+""")
+
+if __name__ == "__main__":
+    demo.launch()
